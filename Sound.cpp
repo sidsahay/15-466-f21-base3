@@ -9,9 +9,15 @@
 #include <exception>
 #include <iostream>
 #include <algorithm>
+#include <random>
 
 //local (to this file) data used by the audio system:
 namespace {
+	std::vector<float> mix_buffer;
+	uint64_t next_crackle = 0;
+	uint64_t crackle_duration = 0;
+	uint64_t global_sample = 0;
+	float crackle_amount = 0.0f;
 
 	//handy constants:
 	constexpr uint32_t const AUDIO_RATE = 48000; //sampling rate
@@ -24,6 +30,134 @@ namespace {
 	std::list< std::shared_ptr< Sound::PlayingSample > > playing_samples;
 
 }
+
+// TODO: use a nicer shared pointers impl
+Sound::GlitchSynth synths[Sound::NUM_SYNTHS];
+
+void Sound::GlitchSynth::set_attack(float amp, uint64_t at) {
+	attack_amplitude = amp;
+	attack_threshold = at;
+}
+
+void Sound::GlitchSynth::set_decay(float amp, uint64_t at) {
+	decay_amplitude = amp;
+	decay_threshold = at;
+}
+
+// sustain doesn't have a time because it's held as long as the player holds a key down
+void Sound::GlitchSynth::set_sustain(float amp) {
+	sustain_amplitude = amp;
+}
+
+void Sound::GlitchSynth::set_release(float amp, uint64_t at) {
+	release_amplitude = amp;
+	release_threshold = at;
+}
+
+// stop current note, setup for playing new note
+// TODO: find cause of ADSR not following smoothly
+void Sound::GlitchSynth::play(float frequency) {
+	cycle_length = uint64_t(AUDIO_RATE/frequency);
+	current_sample_number = 0;
+	release_start = 0;
+	adsr_state = ADSR_ATTACK;
+	do_release = false;
+}
+
+// add own samples to given buffer
+void Sound::GlitchSynth::generate_samples(int n, std::vector<float>& buffer) {
+	int half_cycle = int(cycle_length/2);
+	uint64_t ad_threshold = attack_threshold + decay_threshold;
+	static std::mt19937 mt;
+
+	for (int i = 0; i < n; i++) {
+		int cycle_position = int(current_sample_number % cycle_length);
+		float s = 0;
+		switch (osc) {
+			case OSC_SQUARE: // +1 for half cycle, -1 for other half
+				// o p t i m i z e d
+				s = float((cycle_position <= half_cycle) - (cycle_position > half_cycle));
+				break;
+
+			case OSC_SAW: // from -1 to +1 over a cycle
+				s = (2.0f * cycle_position/float(cycle_length)) - 1.0f;
+				break;
+
+			case OSC_SINE: // standard sine
+				s = 2.0f * std::sinf(3.1415926f * (cycle_position/float(cycle_length))) - 1.0f;
+				break;
+
+			case OSC_NOISE: // uniform noise. TODO: use noise with a peaked distribution
+				s = 2.0f * (mt()/float(mt.max())) - 1.0f;
+				break;
+		}
+
+		float amp = 0.0f;
+		float t = 0;
+
+		// run ADSR envelope
+		switch(adsr_state) {
+			case ADSR_ATTACK:
+				// interpolate from 0 to attack_amplitude
+				amp = attack_amplitude * (current_sample_number/float(attack_threshold));
+				if ((current_sample_number + 1) > attack_threshold) {
+					adsr_state = ADSR_DECAY;
+				}
+				// need to be able to execute a release ASAP
+				else if (do_release) {
+					adsr_state = ADSR_RELEASE;
+					release_start = current_sample_number;
+					do_release = false;
+				}
+				break;
+			
+			case ADSR_DECAY:
+				// interpolate from attack_amplitude to decay_amplitude
+				t = (current_sample_number - attack_threshold) / float(decay_threshold);
+				amp = attack_amplitude * (1.0f - t) + decay_amplitude * t;
+				if ((current_sample_number + 1) > ad_threshold) {
+					adsr_state = ADSR_SUSTAIN;
+				}
+				else if (do_release) {
+					adsr_state = ADSR_RELEASE;
+					release_start = current_sample_number;
+					do_release = false;
+				}
+				break;
+
+			case ADSR_SUSTAIN:
+				// hold at sustain_amplitude till key is released
+				if (do_release) {
+					adsr_state = ADSR_RELEASE;
+					release_start = current_sample_number;
+					do_release = false;
+				}
+				amp = sustain_amplitude;
+				break;
+
+			case ADSR_RELEASE:
+				// interpolate from sustain_amplitude to release_amplitude
+				t = (current_sample_number - release_start) / float(release_threshold);
+				amp = sustain_amplitude * (1.0f - t) + release_amplitude * t;
+				if ((current_sample_number + 1) > (release_start + release_threshold)) {
+					adsr_state = ADSR_END;
+				}
+				break;
+
+			case ADSR_END:
+				// hold release_amplitude
+				amp = release_amplitude;
+				break;
+
+			default:
+				amp = 0.0f;
+		}
+
+		buffer[i] += s * volume * amp;
+		current_sample_number++;
+	}
+}
+
 
 //public-facing data:
 
@@ -53,6 +187,15 @@ Sound::Sample::Sample(std::vector< float > const &data_) : data(data_) {
 
 
 
+
+void Sound::lock() {
+	if (device) SDL_LockAudioDevice(device);
+}
+
+void Sound::unlock() {
+	if (device) SDL_UnlockAudioDevice(device);
+}
+
 void Sound::init() {
 	if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
 		std::cerr << "Failed to initialize SDL audio subsytem:\n" << SDL_GetError() << std::endl;
@@ -69,6 +212,13 @@ void Sound::init() {
 	want.samples = MIX_SAMPLES;
 	want.callback = mix_audio;
 
+	mix_buffer.reserve(MIX_SAMPLES);
+	crackle_duration = 200;
+
+	for (int i = 0; i < Sound::NUM_SYNTHS; i++) {
+		synths[i].is_on = false;
+	}
+	
 	device = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
 	if (device == 0) {
 		std::cerr << "Failed to open audio device:\n" << SDL_GetError() << std::endl;
@@ -90,14 +240,6 @@ void Sound::shutdown() {
 	}
 }
 
-
-void Sound::lock() {
-	if (device) SDL_LockAudioDevice(device);
-}
-
-void Sound::unlock() {
-	if (device) SDL_UnlockAudioDevice(device);
-}
 
 std::shared_ptr< Sound::PlayingSample > Sound::play(Sample const &sample, float volume, float pan) {
 	std::shared_ptr< Sound::PlayingSample > playing_sample = std::make_shared< Sound::PlayingSample >(sample, volume, pan, false);
@@ -313,6 +455,9 @@ void step_direction_ramp(Sound::Ramp< glm::vec3 > &ramp) {
 //The audio callback -- invoked by SDL when it needs more sound to play:
 void mix_audio(void *, Uint8 *buffer_, int len) {
 	assert(buffer_); //should always have some audio buffer
+	
+	// for crackle effect
+	static std::mt19937 mt;
 
 	struct LR {
 		float l;
@@ -322,117 +467,83 @@ void mix_audio(void *, Uint8 *buffer_, int len) {
 	assert(len == MIX_SAMPLES * sizeof(LR)); //should always have the expected number of samples
 	LR *buffer = reinterpret_cast< LR * >(buffer_);
 
-	//zero the output buffer:
-	for (uint32_t s = 0; s < MIX_SAMPLES; ++s) {
-		buffer[s].l = 0.0f;
-		buffer[s].r = 0.0f;
+	int on_counter = 0;
+
+	// zero out buffer
+	for (int i = 0; i < MIX_SAMPLES; i++) {
+		mix_buffer[i] = 0;
 	}
 
-	//update global values:
-	float start_volume = Sound::volume.value;
-	glm::vec3 start_position =  Sound::listener.position.value;
-	glm::vec3 start_right =  Sound::listener.right.value;
-
-	step_value_ramp(Sound::volume);
-	step_position_ramp( Sound::listener.position);
-	step_direction_ramp( Sound::listener.right);
-
-	float end_volume = Sound::volume.value;
-	glm::vec3 end_position =  Sound::listener.position.value;
-	glm::vec3 end_right =  Sound::listener.right.value;
-
-	//add audio from each playing sample into the buffer:
-	for (auto si = playing_samples.begin(); si != playing_samples.end(); /* later */) {
-		Sound::PlayingSample &playing_sample = **si; //much more convenient than writing ** everywhere.
-
-		//Figure out sample panning/volume at start...
-		LR start_pan;
-		if (!(playing_sample.pan.value == playing_sample.pan.value)) {
-			//3D panning
-			compute_pan_from_listener_and_position(
-				start_position, start_right,
-				playing_sample.position.value,
-				playing_sample.half_volume_radius.value,
-				&start_pan.l, &start_pan.r);
-
-			step_position_ramp(playing_sample.position);
-			step_value_ramp(playing_sample.half_volume_radius);
-		} else {
-			//2D panning
-			compute_pan_weights(playing_sample.pan.value, &start_pan.l, &start_pan.r);
-
-			step_value_ramp(playing_sample.pan);
+	// only run active synths
+	for (int i = 0; i < Sound::NUM_SYNTHS; i++) {
+		if (synths[i].is_on) {
+			// get the ith synth to add its samples to mix_buffer
+			synths[i].generate_samples(MIX_SAMPLES, mix_buffer);
+			on_counter++;
 		}
-		start_pan.l *= start_volume * playing_sample.volume.value;
-		start_pan.r *= start_volume * playing_sample.volume.value;
+	}
 
-		step_value_ramp(playing_sample.volume);
+	// don't waste time running LPF and crackle for empty samples
+	if (on_counter == 0) {
+		for (auto s = 0; s < MIX_SAMPLES; s++) {
+			buffer[s].l = 0;
+			buffer[s].r = 0;
+		}
+	}
+	else {
+		
+		// budget low pass filter (ye olde average) to make the synth sound bearable
+		// output[i] = avg(sample[i-2], sample[i-1], sample[i], sample[i+1], sample[i+2])
+		// an actually competent implementation would use a FFT and a gaussian filter shape or something
 
-		//..and end of the mix period:
-		LR end_pan;
-		if (!(playing_sample.pan.value == playing_sample.pan.value)) {
-			//3D panning
-			compute_pan_from_listener_and_position(
-				end_position, end_right,
-				playing_sample.position.value,
-				playing_sample.half_volume_radius.value,
-				&end_pan.l, &end_pan.r);
-		} else {
-			//2D panning
-			compute_pan_weights(playing_sample.pan.value, &end_pan.l, &end_pan.r);
+		// first, deal with edge cases
+		buffer[0].l = mix_buffer[0] / on_counter;
+		buffer[1].l = mix_buffer[1] / on_counter;
+		buffer[MIX_SAMPLES-1].l = mix_buffer[MIX_SAMPLES-1] / on_counter;
+		buffer[MIX_SAMPLES-2].l = mix_buffer[MIX_SAMPLES-2] / on_counter;
+		buffer[MIX_SAMPLES-3].l = mix_buffer[MIX_SAMPLES-3] / on_counter;
+		buffer[0].r = mix_buffer[0] / on_counter;
+		buffer[1].r = mix_buffer[1] / on_counter;
+		buffer[MIX_SAMPLES-1].r = mix_buffer[MIX_SAMPLES-1] / on_counter;
+		buffer[MIX_SAMPLES-2].r = mix_buffer[MIX_SAMPLES-2] / on_counter;
+		buffer[MIX_SAMPLES-3].r = mix_buffer[MIX_SAMPLES-3] / on_counter;
+
+		float running_buffer = 0.0f;
+		
+		float crackle_factor = 1.0f;
+
+		// initialize running sum
+		for (int i = 0; i < 5; i++) {
+			running_buffer += mix_buffer[i] / on_counter;
 		}
 
-		end_pan.l *= end_volume * playing_sample.volume.value;
-		end_pan.r *= end_volume * playing_sample.volume.value;
+		// do LPF and crackle
+		for (uint32_t s = 2; s < MIX_SAMPLES-3; ++s) {
+			global_sample++;
 
-		//figure out a step to add at each sample so that pan will move smoothly from start to end:
-		LR pan = start_pan;
-		LR pan_step;
-		pan_step.l = (end_pan.l - start_pan.l) / MIX_SAMPLES;
-		pan_step.r = (end_pan.r - start_pan.r) / MIX_SAMPLES;
-
-		assert(playing_sample.i < playing_sample.data.size());
-
-		for (uint32_t i = 0; i < MIX_SAMPLES; ++i) {
-			//mix one sample based on current pan values:
-			buffer[i].l += pan.l * playing_sample.data[playing_sample.i];
-			buffer[i].r += pan.r * playing_sample.data[playing_sample.i];
-
-			//update position in sample:
-			playing_sample.i += 1;
-			if (playing_sample.i == playing_sample.data.size()) {
-				if (playing_sample.loop) {
-					playing_sample.i = 0;
-				} else {
-					break;
-				}
+			// create crackling "sparks" in the output sound, as if our player character is malfunctioning
+			// this relieves some of the suffocation of the monotonous bassline and drums
+			// TODO: use rain sounds etc. to do this instead
+			if (global_sample >= next_crackle) {
+				crackle_duration = 2000 + uint64_t((mt()/float(mt.max())) * 2000);
+				next_crackle = global_sample + 5000 + uint64_t((mt()/float(mt.max())) * 50000);
+				crackle_amount = 0.8f + 0.2f * mt()/float(mt.max());
 			}
+			if (crackle_duration == 0) {
+				crackle_factor = 1.0f;
+			}
+			else {
+				crackle_duration--;
+				crackle_factor = (1.0f - crackle_amount) * (mt()/float(mt.max())) + crackle_amount;
+			}
+			float mix = crackle_factor * running_buffer / 5.0f;
+			buffer[s].l = mix;
+			buffer[s].r = mix;
 
-			//update pan values:
-			pan.l += pan_step.l;
-			pan.r += pan_step.r;
-		}
-
-		if (playing_sample.i >= playing_sample.data.size()
-		 || (playing_sample.stopping && playing_sample.volume.value == 0.0f)) { //sample has finished
-		 	playing_sample.stopped = true;
-			//erase from list:
-			auto old = si;
-			++si;
-			playing_samples.erase(old);
-		} else {
-			++si;
+			// update the running sum so we don't recompute ALL of the sums every single time
+			running_buffer = running_buffer - (mix_buffer[s-2]/on_counter) + (mix_buffer[s+3]/on_counter);
 		}
 	}
-
-	/*//DEBUG: report output power:
-	float max_power = 0.0f;
-	for (uint32_t s = 0; s < MIX_SAMPLES; ++s) {
-		max_power = std::max(max_power, (buffer[s].l * buffer[s].l + buffer[s].r * buffer[s].r));
-	}
-	std::cout << "Max Power: " << std::sqrt(max_power) << "; playing samples: " << playing_samples.size() << std::endl; //DEBUG
-	*/
-
 }
 
 

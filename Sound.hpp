@@ -12,6 +12,66 @@
 
 namespace Sound {
 
+constexpr int NUM_SYNTHS = 6;
+
+/**
+ * GlitchSynth - garbage quality software synth made just for this game
+ * Synth Pipeline: Oscillator -> ADSR Envelope Generator -> (in mix_audio()) Budget LPF -> (in mix_audio()) crackle effect
+ * Oscillators: square, saw, sine, noise
+ * Most of the "expressiveness" (such as it is) will have to come from the ADSR generator
+ * Although the ADSR generator uses linear curves, so doesn't sound too snappy either.
+ **/
+struct GlitchSynth {
+	// sample number in the current note
+	uint64_t current_sample_number;
+
+	// how many samples till the cycle flips
+	uint64_t cycle_length;
+
+	// ADSR target amplitude
+	float attack_amplitude = 0.0f;
+	float decay_amplitude = 0.0f;
+	float sustain_amplitude = 0.0f;
+	float release_amplitude = 0.0f;
+	float volume = 1.0f;
+
+	// ADSR sample thresholds ("time")
+	uint64_t attack_threshold = 0;
+	uint64_t decay_threshold = 0;
+	uint64_t release_threshold = 0;
+	uint64_t release_start = 0;
+
+	enum {
+		ADSR_ATTACK,
+		ADSR_DECAY,
+		ADSR_SUSTAIN,
+		ADSR_RELEASE,
+		ADSR_END
+	} adsr_state = ADSR_ATTACK;
+
+	enum {
+		OSC_SQUARE,
+		OSC_SAW,
+		OSC_SINE,
+		OSC_NOISE
+	} osc = OSC_SINE;
+
+	bool do_release = false;
+	bool is_on = false;
+
+	// start playing a new note
+	void play(float frequency);
+
+	void set_attack(float amp, uint64_t at);
+	void set_decay(float amp, uint64_t dt);
+	void set_sustain(float amp);
+	void set_release(float amp, uint64_t rt);
+
+	// generate n new samples into given vector
+	// we assume here that the vector can actually hold n samples
+	void generate_samples(int n, std::vector<float>& buffer);
+};
+
 //Sample objects hold mono (one-channel) audio.
 struct Sample {
 	//Load from a '.wav' or '.opus' file.
@@ -24,6 +84,7 @@ struct Sample {
 	//sample data is stored as 48kHz, mono, floating-point:
 	std::vector< float > data;
 };
+
 
 //Ramp<> manages values that should be smoothly interpolated
 //  to a target over a certain amount of time:
