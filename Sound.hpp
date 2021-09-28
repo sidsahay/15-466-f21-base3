@@ -15,7 +15,7 @@ namespace Sound {
 constexpr int NUM_SYNTHS = 6;
 
 /**
- * GlitchSynth - garbage quality software synth made just for this game
+ * GlitchSynth - garbage software synth
  * Synth Pipeline: Oscillator -> ADSR Envelope Generator -> (in mix_audio()) Budget LPF -> (in mix_audio()) crackle effect
  * Oscillators: square, saw, sine, noise
  * Most of the "expressiveness" (such as it is) will have to come from the ADSR generator
